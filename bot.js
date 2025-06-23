@@ -26,7 +26,7 @@ const logger = {
   banner: () => {
     console.log(`${colors.cyan}${colors.bold}`);
     console.log(`---------------------------------------------`);
-    console.log(`  Goblin Auto Bot - Airdrop Insiders  `);
+    console.log(`  Goblin Auto   `);
     console.log(`---------------------------------------------${colors.reset}`);
     console.log();
   },
