@@ -1,324 +1,360 @@
-require('dotenv').config();
-const axios = require('axios');
-const cheerio = require('cheerio');
-const userAgents = require('user-agents');
+// index.js
+
+const cron = require('node-cron');
+const GoblinManager = require('./goblin-manager');
+const logger = require('./logger');
+const config = require('./config');
 const fs = require('fs');
 
-const colors = {
-  reset: "\x1b[0m",
-  cyan: "\x1b[36m",
-  green: "\x1b[32m",
-  yellow: "\x1b[33m",
-  red: "\x1b[31m",
-  white: "\x1b[37m",
-  bold: "\x1b[1m",
-  blue: "\x1b[34m",
-  magenta: "\x1b[35m",
-};
-
-const logger = {
-  info: (msg) => console.log(`${colors.green}[✓] ${msg}${colors.reset}`),
-  warn: (msg) => console.log(`${colors.yellow}[⚠] ${msg}${colors.reset}`),
-  error: (msg) => console.log(`${colors.red}[✗] ${msg}${colors.reset}`),
-  success: (msg) => console.log(`${colors.green}[✅] ${msg}${colors.reset}`),
-  loading: (msg) => console.log(`${colors.cyan}[⟳] ${msg}${colors.reset}`),
-  step: (msg) => console.log(`${colors.white}[➤] ${msg}${colors.reset}`),
-  banner: () => {
-    console.log(`${colors.cyan}${colors.bold}`);
-    console.log(`---------------------------------------------`);
-    console.log(`  Goblin Auto   `);
-    console.log(`---------------------------------------------${colors.reset}`);
-    console.log();
-  },
-};
-
-const getRandomUserAgent = () => {
-  const ua = new userAgents();
-  return ua.toString();
-};
-
-const getAxiosConfig = (fullCookieString, refererUrl = 'https://www.goblin.meme/') => ({
-  headers: {
-    'accept': 'application/json, text/plain, */*',
-    'accept-language': 'en-US,en;q=0.7',
-    'priority': 'u=1, i',
-    'sec-ch-ua': getRandomUserAgent(),
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'empty',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-site': 'same-origin',
-    'sec-gpc': '1',
-    'cookie': fullCookieString,
-    'Referer': refererUrl,
-    'Referrer-Policy': 'strict-origin-when-cross-origin',
-  },
-});
-
-const getUserAxiosConfig = (fullCookieString, refererUrl = 'https://twitter.com/') => ({
-  headers: {
-    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'accept-language': 'en-US,en;q=0.7',
-    'cache-control': 'max-age=0',
-    'priority': 'u=0, i',
-    'sec-ch-ua': getRandomUserAgent(),
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'document',
-    'sec-fetch-mode': 'navigate',
-    'sec-fetch-site': 'same-origin',
-    'sec-fetch-user': '?1',
-    'sec-gpc': '1',
-    'upgrade-insecure-requests': '1',
-    'cookie': fullCookieString,
-    'Referer': refererUrl,
-    'Referrer-Policy': 'strict-origin-when-cross-origin',
-  },
-});
-
-const fetchUserData = async (fullCookieString) => {
-  try {
-    logger.loading('Fetching user data...');
-    const sessionResponse = await axios.get('https://www.goblin.meme/api/auth/session', getAxiosConfig(fullCookieString, 'https://www.goblin.meme/'));
-    if (sessionResponse.status !== 200 || !sessionResponse.data || !sessionResponse.data.user) {
-        throw new Error('Invalid session response from /api/auth/session');
+// --- Fungsi utilitas tambahan (untuk logging saja, tidak memblokir) ---
+const logRemainingTime = (accountName, boxName, readyAt) => {
+    const now = new Date();
+    const readyAtTime = new Date(readyAt);
+    if (readyAtTime > now) {
+        const timeLeft = readyAtTime - now;
+        const hours = Math.floor(timeLeft / (1000 * 60 * 60));
+        const minutes = Math.floor(((timeLeft % (1000 * 60 * 60)) / (1000 * 60)));
+        const seconds = Math.floor(((timeLeft % (1000 * 60)) / 1000));
+        logger.warn(`[${accountName}] Kotak '${boxName}' sedang ditambang, siap dalam: ${hours}j ${minutes}m ${seconds}d.`);
+    } else {
+        logger.warn(`[${accountName}] Kotak '${boxName}' seharusnya sudah siap diklaim. Akan dicoba di siklus berikutnya.`);
     }
-    const userData = sessionResponse.data.user;
-    
-    let rank = 'N/A';
-    let totalPoints = 'N/A';
+};
+
+/**
+ * Memproses satu akun (termasuk klaim dan memulai penambangan)
+ * @param {GoblinManager} goblinManagerInstance Instansi GoblinManager untuk akun ini.
+ */
+async function processAccountAutomation(goblinManagerInstance) {
+    const accountName = goblinManagerInstance.accountName;
+    logger.step(`[${accountName}] Memulai pemrosesan akun...`);
+
     try {
-        const homepageResponse = await axios.get('https://www.goblin.meme/', getUserAxiosConfig(fullCookieString));
-        const $ = cheerio.load(homepageResponse.data);
-        const rankElement = $('.w-16.h-16.bg-lime-400.rounded-full').text().trim().replace('#', '');
-        rank = rankElement ? parseInt(rankElement) : 'N/A';
-        const pointsElement = $('.inline-flex.items-center.rounded-md.border.px-2\\.5.py-0\\.5.text-xs').first().text().trim();
-        const pointsMatch = pointsElement.match(/(\d+)\s*Total Goblin Points/);
-        totalPoints = pointsMatch ? parseInt(pointsMatch[1]) : 'N/A';
-    } catch (htmlError) {
-        logger.warn(`Could not fetch rank/points from homepage: ${htmlError.message}`);
-    }
+        // Cek validitas cookie
+        const isValid = await goblinManagerInstance.validateCookie();
+        if (!isValid) {
+            logger.error(`[${accountName}] Cookie tidak valid atau sudah kadaluarsa. Melewatkan akun ini.`);
+            return;
+        }
 
-    logger.success(`User Name: ${userData.name || 'N/A'}`);
-    logger.success(`User Rank: #${rank}`);
-    logger.success(`Total Goblin Points: ${totalPoints}`);
-    return { name: userData.name, rank, totalPoints };
-  } catch (error) {
-    logger.error(`Failed to fetch user data: ${error.message}`);
-    if (error.response) {
-      logger.error(`Status: ${error.response.status}, Data: ${typeof error.response.data === 'string' ? error.response.data.substring(0, 200) + '...' : JSON.stringify(error.response.data)}`);
-    }
-    throw new Error('User data fetch failed, likely due to invalid/expired cookie.');
-  }
-};
-
-const displayCountdown = (readyAt) => {
-  return new Promise((resolve) => {
-    if (!readyAt || isNaN(new Date(readyAt).getTime())) {
-      logger.warn('Invalid or null readyAt time provided. Skipping countdown.');
-      resolve();
-      return;
-    }
-
-    const updateCountdown = () => {
-      const now = new Date();
-      const timeLeft = new Date(readyAt) - now;
-      
-      if (timeLeft <= 0) {
-        process.stdout.write(`\r${colors.green}[⏰] Countdown finished! Mining is ready to be claimed or started.${colors.reset}\n`);
-        clearInterval(countdownInterval);
-        resolve();
-        return;
-      }
-
-      const hours = Math.floor(timeLeft / (1000 * 60 * 60));
-      const minutes = Math.floor((timeLeft % (1000 * 60 * 60)) / (1000 * 60));
-      const seconds = Math.floor((timeLeft % (1000 * 60)) / 1000);
-      
-      process.stdout.write(`\r${colors.cyan}[⏰] Waiting: ${hours}h ${minutes}m ${seconds}s${colors.reset}    `);
-    };
-
-    updateCountdown();
-    const countdownInterval = setInterval(updateCountdown, 1000);
-  });
-};
-
-const getBoxDetails = async (boxId, fullCookieString) => {
-  try {
-    logger.loading(`Checking box details for ID: ${boxId}...`);
-    const config = getAxiosConfig(fullCookieString, `https://www.goblin.meme/box/${boxId}`);
-    const response = await axios.get(
-      `https://www.goblin.meme/api/box/${boxId}`,
-      config
-    );
-    logger.info(`Box Details: ${JSON.stringify(response.data)}`);
-    return response.data;
-  } catch (error) {
-    logger.error(`Failed to get box details for ${boxId}: ${error.message}`);
-    if (error.response) {
-      logger.error(`Status: ${error.response.status}, Data: ${typeof error.response.data === 'string' ? error.response.data.substring(0, 200) + '...' : JSON.stringify(error.response.data)}`);
-    }
-    throw error;
-  }
-};
-
-const startMining = async (boxId, fullCookieString) => {
-  try {
-    logger.loading('Starting mining...');
-    const config = getAxiosConfig(fullCookieString, `https://www.goblin.meme/box/${boxId}`);
-    config.headers['Content-Length'] = '0';
-    config.headers['Content-Type'] = undefined;
-    config.headers['accept'] = 'application/json, text/plain, */*'; 
-
-    const response = await axios.post(
-      `https://www.goblin.meme/api/box/${boxId}/start`,
-      null,
-      config
-    );
-    
-    logger.success(`Mining started: ${response.data.message}`);
-    logger.info(`Prize: ${response.data.box.prizeAmount} ${response.data.box.prizeType}`);
-    logger.info(`Ready at: ${new Date(response.data.box.readyAt).toLocaleString()}`);
-    return response.data.box.readyAt;
-  } catch (error) {
-    logger.error(`Failed to start mining: ${error.message}`);
-    if (error.response) {
-      logger.error(`Status: ${error.response.status}, Data: ${typeof error.response.data === 'string' ? error.response.data.substring(0, 200) + '...' : JSON.stringify(error.response.data)}`);
-    }
-    throw error;
-  }
-};
-
-const claimBox = async (boxId, fullCookieString) => {
-  try {
-    logger.loading(`Claiming box ${boxId}...`);
-    const claimUrl = `https://www.goblin.meme/api/box/${boxId}/claim`; 
-    const config = getAxiosConfig(fullCookieString, `https://www.goblin.meme/box/${boxId}`);
-    config.headers['Content-Length'] = '0';
-    config.headers['Content-Type'] = undefined;
-    config.headers['accept'] = 'application/json, text/plain, */*';
-
-    const response = await axios.post(claimUrl, null, config);
-    
-    logger.success(`Claimed box ${boxId}: ${response.data.message}`);
-    logger.info(`Claimed prize: ${response.data.prizeAmount} ${response.data.prizeType}`);
-    return response.data;
-  } catch (error) {
-    logger.error(`Failed to claim box ${boxId}: ${error.message}`);
-    if (error.response) {
-      logger.error(`Status: ${error.response.status}, Data: ${typeof error.response.data === 'string' ? error.response.data.substring(0, 200) + '...' : JSON.stringify(error.response.data)}`);
-    }
-    throw error;
-  }
-};
-
-const getAllBoxes = async (fullCookieString) => {
-  try {
-    logger.loading('Fetching all available boxes...');
-    const config = getAxiosConfig(fullCookieString, 'https://www.goblin.meme/box');
-    const response = await axios.get('https://www.goblin.meme/api/box', config);
-    logger.info(`Fetched ${response.data.boxes.length} boxes.`);
-    return response.data.boxes;
-  } catch (error) {
-    logger.error(`Failed to fetch all boxes: ${error.message}`);
-    if (error.response) {
-      logger.error(`Status: ${error.response.status}, Data: ${typeof error.response.data === 'string' ? error.response.data.substring(0, 200) + '...' : JSON.stringify(error.response.data)}`);
-    }
-    return [];
-  }
-};
-
-const processAccount = async (fullCookieString, accountName) => {
-  logger.step(`Processing ${accountName}...`);
-
-  try {
-    await fetchUserData(fullCookieString);
-
-    const availableBoxes = await getAllBoxes(fullCookieString);
-    
-    let boxActionTaken = false;
-
-    for (const box of availableBoxes) {
-      if (box.active) { 
-        const boxDetail = await getBoxDetails(box._id, fullCookieString);
+        await goblinManagerInstance.getUserInfo(); // Ambil info pengguna
         
-        if (boxDetail.isReady && !boxDetail.opened) {
-          logger.success(`[${accountName}] Box '${box.name}' is ready to be claimed!`);
-          try {
-              await claimBox(box._id, fullCookieString);
-              logger.success(`[${accountName}] Successfully claimed box '${box.name}'.`);
-              await new Promise(resolve => setTimeout(resolve, 5000)); 
-              boxActionTaken = true;
-          } catch (claimError) {
-              logger.error(`[${accountName}] Failed to claim box '${box.name}': ${claimError.message}`);
-          }
-        } 
+        let allAvailableBoxes;
+        try {
+            allAvailableBoxes = await goblinManagerInstance.getAllBoxes(); // Ambil semua kotak dari API (tidak difilter .active di sini)
+        } catch (error) {
+            logger.error(`[${accountName}] Gagal mengambil daftar semua kotak. Melewatkan akun ini. Error: ${error.message}`);
+            // Melemparkan error agar bisa ditangkap oleh retry di main loop
+            throw new Error(`Failed to get all boxes for ${accountName}: ${error.message}`);
+        }
+
+        if (allAvailableBoxes.length === 0) {
+            logger.info(`[${accountName}] Tidak ada kotak aktif ditemukan untuk akun ini.`);
+            return;
+        }
+
+        let claimedAnyBox = false; // Tetap lacak apakah ada box yang diklaim
+        let activeMiningBox = null;
+
+        // --- Tahap 1: Memeriksa dan mengklaim kotak yang siap ---
+        logger.step(`[${accountName}] Tahap 1: Memeriksa dan mengklaim kotak yang siap.`);
+        for (const box of allAvailableBoxes) {
+            // Dapatkan detail kotak terbaru di setiap iterasi
+            let boxDetail;
+            try {
+                boxDetail = await goblinManagerInstance.getBoxStatus(box._id);
+            } catch (detailError) {
+                logger.error(`[${accountName}] Gagal mengambil detail untuk kotak '${box.name}' (ID: ${box._id}). Melewatkan klaim/status untuk kotak ini. Error: ${detailError.message}`);
+                continue; // Lanjutkan ke kotak berikutnya jika gagal mendapatkan detail
+            }
+
+            if (!boxDetail.active) { // Jika boxDetail melaporkan tidak aktif
+                logger.info(`[${accountName}] Kotak '${box.name}' (ID: ${box._id}) tidak aktif. Melewatkan.`);
+                continue; 
+            }
+
+            if (boxDetail.isReady && !boxDetail.opened && config.processing.autoOpen) {
+                logger.success(`[${accountName}] Kotak '${box.name}' (ID: ${box._id}) siap diklaim!`);
+                const openResult = await goblinManagerInstance.openBox(box._id, boxDetail); // Meneruskan boxDetail
+                if (openResult.success) {
+                    logger.success(`[${accountName}] BERHASIL! Kotak ${box.name} sudah dibuka. Hadiah: ${openResult.reward} ${openResult.rewardType}`);
+                    claimedAnyBox = true; // Setel ke true jika berhasil klaim
+                } else {
+                    logger.error(`[${accountName}] Gagal membuka/mengklaim kotak ${box.name}: ${openResult.message}`);
+                    throw new Error(`Failed to claim box ${box.name} for ${accountName}: ${openResult.message}`);
+                }
+                await new Promise(resolve => setTimeout(resolve, config.processing.delayBetweenBoxes));
+            } else if (boxDetail.startTime !== null && !boxDetail.isReady && !boxDetail.opened) {
+                // Kotak ini sedang ditambang
+                activeMiningBox = boxDetail; // Simpan detail kotak yang sedang ditambang
+                logger.warn(`[${accountName}] Kotak '${boxDetail.name}' (ID: ${boxDetail._id}) sudah dalam proses penambangan.`);
+                logRemainingTime(accountName, boxDetail.name, boxDetail.readyAt); // Hanya log, tidak memblokir
+            } else if (boxDetail.opened) {
+                logger.info(`[${accountName}] Kotak '${box.name}' (ID: ${box._id}) sudah dibuka/diklaim.`);
+            } else { // Kondisi default jika box tidak ready, tidak mining, tidak dibuka, dan aktif
+                logger.debug(`[${accountName}] Kotak '${box.name}' (ID: ${box._id}) belum siap untuk diklaim atau dimulai. Status: ${JSON.stringify(boxDetail)}`);
+            }
+        }
+
+        // --- Tahap 2: Memulai penambangan (prioritas 'The Mich Khan') ---
+        // PERUBAHAN UTAMA DI SINI:
+        // Kita tidak lagi menggunakan `if (claimedAnyBox)` untuk *menghindari* start mining.
+        // Klaim box sekarang dianggap sebagai satu aktivitas, dan start mining adalah aktivitas lain.
+        logger.step(`[${accountName}] Tahap 2: Memeriksa untuk memulai penambangan kotak baru.`);
         
-        if (box.active && boxDetail.startTime === null && boxDetail.isReady === false) {
-          logger.info(`[${accountName}] Found active box '${box.name}' ready to START MINING!`);
-          const readyAt = await startMining(box._id, fullCookieString);
-          logger.success(`[${accountName}] Mining for '${box.name}' started successfully. Will be ready at: ${new Date(readyAt).toLocaleString()}.`);
-          boxActionTaken = true;
-        } else if (boxDetail.startTime !== null && boxDetail.isReady === false) {
-          logger.warn(`[${accountName}] Box '${box.name}' is already mining. Will be ready at: ${new Date(boxDetail.readyAt).toLocaleString()}.`);
-          boxActionTaken = true;
-        } else if (boxDetail.opened) {
-            logger.info(`[${accountName}] Box '${box.name}' already opened/claimed.`);
+        if (activeMiningBox) { // Jika sudah ada box yang ditambang, jangan start yang lain
+            logger.warn(`[${accountName}] Sudah ada kotak aktif yang ditambang ('${activeMiningBox.name}' ID: ${activeMiningBox._id}). Tidak akan memulai penambangan kotak lain.`);
+            logRemainingTime(accountName, activeMiningBox.name, activeMiningBox.readyAt); // Hanya log, tidak memblokir
+        } else if (config.processing.autoStart) { // Jika autoStart diaktifkan dan tidak ada box yang sedang mining
+            let boxToStart = null;
+            
+            // Prioritas pertama: "The Mich Khan"
+            const michKhanBox = allAvailableBoxes.find(b => b.name === "The Mich Khan"); // Cari berdasarkan nama di semua box
+            if (michKhanBox) { // Jika The Mich Khan ditemukan di daftar awal
+                const michKhanDetail = await goblinManagerInstance.getBoxStatus(michKhanBox._id);
+                // Pastikan box aktif dan belum dimulai mining
+                if (michKhanDetail.active && michKhanDetail.startTime === null && michKhanDetail.isReady === false && !michKhanDetail.opened) {
+                    boxToStart = michKhanDetail;
+                    logger.info(`[${accountName}] Memprioritaskan 'The Mich Khan' (ID: ${boxToStart._id}) untuk dimulai penambangan.`);
+                } else {
+                    logger.info(`[${accountName}] Kotak 'The Mich Khan' ditemukan tetapi tidak dalam kondisi untuk memulai penambangan: ${JSON.stringify(michKhanDetail)}`);
+                }
+            }
+
+            // Jika 'The Mich Khan' tidak bisa dimulai, cari kotak aktif lain yang bisa dimulai.
+            if (!boxToStart) {
+                logger.info(`[${accountName}] 'The Mich Khan' tidak dapat dimulai. Mencari kotak aktif lainnya.`);
+                for (const box of allAvailableBoxes) { // Ulangi semuaAvailableBoxes
+                    if (box.name !== "The Mich Khan") { // Lewati The Mich Khan karena sudah diperiksa
+                        const otherBoxDetail = await goblinManagerInstance.getBoxStatus(box._id);
+                        // Pastikan box aktif dan belum dimulai mining
+                        if (otherBoxDetail.active && otherBoxDetail.startTime === null && otherBoxDetail.isReady === false && !otherBoxDetail.opened) {
+                            boxToStart = otherBoxDetail;
+                            logger.info(`[${accountName}] Memilih kotak '${boxToStart.name}' (ID: ${boxToStart._id}) untuk dimulai penambangan.`);
+                            break; // Ambil kotak aktif pertama yang bisa dimulai
+                        }
+                    }
+                }
+            }
+
+            if (boxToStart) {
+                logger.info(`[${accountName}] Menemukan kotak aktif '${boxToStart.name}' (ID: ${boxToStart._id}) siap untuk MEMULAI PENAMBANGAN!`);
+                const startResult = await goblinManagerInstance.startBox(boxToStart._id);
+                if (startResult.success) {
+                    logger.success(`[${accountName}] Penambangan untuk '${boxToStart.name}' berhasil dimulai. Akan siap pada: ${startResult.readyAt}`);
+                    logRemainingTime(accountName, boxToStart.name, startResult.readyAt); // Hanya log, tidak memblokir
+                } else {
+                    logger.error(`[${accountName}] Gagal memulai penambangan untuk kotak '${boxToStart.name}' (ID: ${boxToStart._id}): ${startResult.message}`);
+                    throw new Error(`Failed to start box ${boxToStart.name} for ${accountName}: ${startResult.message}`);
+                }
+            } else {
+                logger.info(`[${accountName}] Tidak ada kotak yang dapat dimulai penambangannya untuk siklus ini.`);
+            }
         } else {
-            logger.info(`[${accountName}] Box '${box.name}' not in a state to perform action. Details: ${JSON.stringify(boxDetail)}`);
+            logger.info(`[${accountName}] Opsi 'autoStart' dinonaktifkan dalam konfigurasi.`);
         }
+
+    } catch (error) {
+        logger.error(`[${accountName}] Terjadi kesalahan fatal selama pemrosesan akun: ${error.message}`);
+        throw error; 
+    }
+    logger.info(`[${accountName}] Selesai memproses akun.`);
+}
+
+/**
+ * Fungsi utama untuk menjalankan otomatisasi untuk semua akun yang terdaftar
+ */
+async function runAllAccountsAutomation() {
+    logger.banner();
+    logger.info('Memulai siklus otomatisasi untuk semua akun...');
+
+    const accountsFile = 'cookie.txt';
+    let fullCookieStrings = [];
+    const goblinManagers = []; // Array untuk menyimpan instance GoblinManager per akun
+
+    try {
+        const fileContent = fs.readFileSync(accountsFile, 'utf8');
+        fullCookieStrings = fileContent.split('\n')
+                                      .map(line => line.trim())
+                                      .filter(line => line.length > 0);
         
-        if (boxActionTaken) {
-            break; 
+        if (fullCookieStrings.length === 0) {
+            logger.error(`Tidak ada akun ditemukan di ${accountsFile}. Harap tambahkan string cookie lengkap.`);
+            process.exit(1);
         }
-      }
+    } catch (error) {
+        logger.error(`Error membaca ${accountsFile}: ${error.message}`);
+        logger.error('Harap pastikan file ada dan memiliki izin baca. Keluar.');
+        process.exit(1);
     }
 
-    if (!boxActionTaken) {
-      logger.info(`[${accountName}] No direct action (start/claim) taken for any active box this cycle.`);
-    }
+    logger.info(`Memuat ${fullCookieStrings.length} akun dari ${accountsFile}.`);
 
-  } catch (error) {
-    logger.error(`[${accountName}] An error occurred during processing: ${error.message}`);
-  }
-  logger.info(`Finished processing ${accountName}.`);
-  await new Promise(resolve => setTimeout(resolve, 10 * 1000)); 
-};
-
-const main = async () => {
-  logger.banner();
-  
-  const accountsFile = 'cookie.txt';
-  let fullCookieStrings = [];
-
-  try {
-    const fileContent = fs.readFileSync(accountsFile, 'utf8');
-    fullCookieStrings = fileContent.split('\n')
-                                   .map(line => line.trim())
-                                   .filter(line => line.length > 0);
-    if (fullCookieStrings.length === 0) {
-      logger.error(`No accounts found in ${accountsFile}. Please add full cookie strings.`);
-      return;
-    }
-  } catch (error) {
-    logger.error(`Error reading ${accountsFile}: ${error.message}`);
-    logger.error('Please ensure the file exists and has read permissions. Exiting.');
-    return;
-  }
-
-  logger.info(`Loaded ${fullCookieStrings.length} account(s) from ${accountsFile}.`);
-
-  while (true) {
-    logger.info(`Starting new processing cycle for all accounts at ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })} WIB.`);
+    // Inisialisasi GoblinManager untuk setiap akun
     for (let i = 0; i < fullCookieStrings.length; i++) {
-      const fullCookieString = fullCookieStrings[i];
-      const accountName = `Akun_${i + 1}`;
-      await processAccount(fullCookieString, accountName);
+        const cookie = fullCookieStrings[i];
+        const accountName = `Akun_${i + 1}`;
+        goblinManagers.push(new GoblinManager(accountName, cookie));
     }
 
-    logger.info(`All accounts processed for this cycle. Waiting 24 hours for next cycle.`);
-    await new Promise(resolve => setTimeout(resolve, 24 * 60 * 60 * 1000)); 
-  }
-};
+    // Loop utama untuk memproses semua akun
+    // Ini akan berjalan tanpa henti, dengan delay 24 jam antar siklus penuh
+    while (true) {
+        logger.info(`Memulai siklus pemrosesan baru untuk semua akun pada ${new Date().toLocaleString('id-ID', { timeZone: config.scheduler.timezone })}.`);
+        for (const manager of goblinManagers) {
+            let attempt = 0;
+            const maxAttempts = config.api.retryAttempts; // Ambil dari config
 
-main().catch(console.error);
+            while (attempt < maxAttempts) {
+                try {
+                    logger.info(`[MAIN] Memulai pemrosesan untuk ${manager.accountName} (Percobaan ${attempt + 1}/${maxAttempts})...`);
+                    await processAccountAutomation(manager);
+                    logger.info(`[MAIN] Selesai memproses ${manager.accountName}.`);
+                    break; // Keluar dari loop retry jika berhasil
+                } catch (accountError) {
+                    logger.error(`[MAIN ERROR] Gagal memproses ${manager.accountName}: ${accountError.message}.`);
+                    attempt++;
+                    if (attempt < maxAttempts) {
+                        logger.warn(`[MAIN] Mencoba lagi untuk ${manager.accountName} dalam ${config.api.retryDelay / 1000} detik...`);
+                        await new Promise(resolve => setTimeout(resolve, config.api.retryDelay));
+                    } else {
+                        logger.error(`[MAIN] Gagal memproses ${manager.accountName} setelah ${maxAttempts} percobaan. Melewatkan akun ini.`);
+                    }
+                }
+            }
+            // Delay antar akun setelah semua percobaan untuk akun saat ini selesai
+            await new Promise(resolve => setTimeout(resolve, config.processing.delayBetweenAccounts));
+        }
+
+        logger.info(`Semua akun diproses untuk siklus ini. Menunggu 24 jam untuk siklus berikutnya.`);
+        await new Promise(resolve => setTimeout(resolve, 24 * 60 * 60 * 1000)); // Delay 24 jam untuk siklus berikutnya
+    }
+}
+
+// --- Setup cron job dan eksekusi awal ---
+
+// Run automation immediately if called directly (for testing/manual run)
+if (require.main === module) {
+    logger.info('Njalankan automation langsung...');
+    runAllAccountsAutomation().catch(console.error);
+}
+
+// Setup cron job untuk running harian (full automation)
+logger.info(`Setting up cron job untuk running harian jam ${config.scheduler.dailySchedule} WIB...`);
+cron.schedule(config.scheduler.dailySchedule, () => {
+    logger.info('CRON JOB TRIGGERED - Running daily automation');
+    runAllAccountsAutomation().catch(console.error);
+}, {
+    scheduled: true,
+    timezone: config.scheduler.timezone
+});
+
+// Setup cron job tambahan untuk ngecek box sing ready (tidak memulai baru, hanya klaim)
+logger.info(`Setting up cron job untuk ngecek ready boxes saben ${config.scheduler.checkReadySchedule} WIB...`);
+cron.schedule(config.scheduler.checkReadySchedule, async () => {
+    logger.info('CRON JOB TRIGGERED - Checking ready boxes');
+    
+    // Perlu membaca ulang cookie.txt di sini untuk cron job,
+    // karena `goblinManagers` di atas hanya dibuat saat `runAllAccountsAutomation` pertama kali dipanggil.
+    const accountsFile = 'cookie.txt';
+    let fullCookieStrings = [];
+    let checkManagers = [];
+
+    try {
+        const fileContent = fs.readFileSync(accountsFile, 'utf8');
+        fullCookieStrings = fileContent.split('\n')
+                                      .map(line => line.trim())
+                                      .filter(line => line.length > 0);
+        
+        if (fullCookieStrings.length === 0) {
+            logger.error(`Tidak ada akun ditemukan di ${accountsFile} untuk cron check.`);
+            return;
+        }
+    } catch (error) {
+        logger.error(`Error membaca ${accountsFile} untuk cron check: ${error.message}`);
+        return;
+    }
+
+    for (let i = 0; i < fullCookieStrings.length; i++) {
+        checkManagers.push(new GoblinManager(`Akun_Check_${i + 1}`, fullCookieStrings[i]));
+    }
+
+    for (const manager of checkManagers) {
+        // Logika retry untuk cron check juga
+        let attempt = 0;
+        const maxAttempts = config.api.retryAttempts;
+        while (attempt < maxAttempts) {
+            try {
+                logger.info(`[CRON CHECK] Memeriksa box siap klaim untuk ${manager.accountName} (Percobaan ${attempt + 1}/${maxAttempts})...`);
+                const isValid = await manager.validateCookie();
+                if (!isValid) {
+                    logger.error(`[CRON CHECK][${manager.accountName}] Cookie tidak valid. Melewatkan.`);
+                    break; // Tidak perlu retry jika cookie invalid
+                }
+
+                // Mengambil semua kotak tanpa filter .active di sini
+                const boxes = await manager.getAllBoxes(); 
+                for (const box of boxes) {
+                    let boxDetail;
+                    try {
+                        boxDetail = await manager.getBoxStatus(box._id);
+                    } catch (detailError) {
+                        logger.error(`[CRON CHECK][${manager.accountName}] Gagal ambil detail box ${box.name}: ${detailError.message}.`);
+                        continue;
+                    }
+
+                    if (!boxDetail.active) {
+                        logger.debug(`[CRON CHECK][${manager.accountName}] Kotak '${box.name}' (ID: ${box._id}) tidak aktif. Melewatkan.`);
+                        continue;
+                    }
+
+                    if (boxDetail.isReady && !boxDetail.opened && config.processing.autoOpen) {
+                        logger.success(`[CRON CHECK][${manager.accountName}] Box '${boxDetail.name}' ready untuk dibuka!`);
+                        const openResult = await manager.openBox(box._id, boxDetail);
+                        if (openResult.success) {
+                            logger.success(`[CRON CHECK][${manager.accountName}] BERHASIL! Box ${boxDetail.name} dibuka. Reward: ${openResult.reward} ${openResult.rewardType}`);
+                        } else {
+                            logger.error(`[CRON CHECK][${manager.accountName}] Gagal buka box ${boxDetail.name}: ${openResult.message}`);
+                            // Throw error untuk memicu retry jika gagal klaim
+                            throw new Error(`Failed to open box ${boxDetail.name} for ${manager.accountName}: ${openResult.message}`);
+                        }
+                        await new Promise(resolve => setTimeout(resolve, config.processing.delayBetweenChecks));
+                    } else if (boxDetail.startTime !== null && !boxDetail.isReady && !boxDetail.opened) {
+                        logRemainingTime(manager.accountName, boxDetail.name, boxDetail.readyAt);
+                    }
+                }
+                break; // Keluar dari loop retry jika berhasil
+            } catch (error) {
+                logger.error(`[CRON CHECK][${manager.accountName}] Error saat menjalankan cron check: ${error.message}`);
+                attempt++;
+                if (attempt < maxAttempts) {
+                    logger.warn(`[CRON CHECK][${manager.accountName}] Mencoba lagi dalam ${config.api.retryDelay / 1000} detik...`);
+                    await new Promise(resolve => setTimeout(resolve, config.api.retryDelay));
+                } else {
+                    logger.error(`[CRON CHECK][${manager.accountName}] Gagal memproses setelah ${maxAttempts} percobaan. Melewatkan.`);
+                }
+            }
+        }
+        await new Promise(resolve => setTimeout(resolve, config.processing.delayBetweenAccounts || 1000)); // Delay antar akun di cron check
+    }
+    logger.info('CRON JOB - Selesai cek ready boxes.');
+}, {
+    scheduled: true,
+    timezone: config.scheduler.timezone
+});
+
+logger.info('Goblin Box Automation sudah siap! Skrip akan berjalan:');
+logger.info(`- Setiap hari jam ${config.scheduler.dailySchedule} WIB (otomatisasi penuh)`);
+logger.info(`- Setiap ${config.scheduler.checkReadySchedule} WIB (cek box siap klaim)`);
+logger.info('Tekan Ctrl+C untuk menutup skrip.');
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+    logger.info('\nMematikan Goblin Box Automation...');
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    logger.info('\nMematikan Goblin Box Automation...');
+    process.exit(0);
+});
