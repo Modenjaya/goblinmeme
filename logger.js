@@ -1,5 +1,5 @@
 // logger.js
-const config = require('./config'); // Impor konfigurasi untuk level debug
+const config = require('./config'); 
 
 const colors = {
     reset: "\x1b[0m",
